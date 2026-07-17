@@ -89,7 +89,7 @@ canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
 .section-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .section-head h4 { margin: 0; font-size: 12px; letter-spacing: .18em; font-weight: 600; }
 .slots { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.slot { min-height: 70px; border: 1px solid var(--line); background: #0b0e13; padding: 8px; cursor: pointer; position: relative; transition: .2s; }
+.slot { min-height: 58px; border: 1px solid var(--line); background: #0b0e13; padding: 8px; cursor: pointer; position: relative; transition: .2s; }
 .slot:hover { border-color: rgba(138,247,213,.4); }
 .slot.empty { display: grid; place-items: center; color: #39433f; font-size: 22px; }
 .slot .rarity { position:absolute; top:0; left:0; right:0; height:2px; }
@@ -97,7 +97,7 @@ canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
 .slot .bonus { color: var(--mint); font-size: 12px; margin-top: 7px; }
 
 .bag { flex: 1; min-height: 0; padding: 19px 22px; display: flex; flex-direction: column; }
-.bag-list { display: grid; gap: 7px; overflow-y: auto; padding-right: 4px; }
+.bag-list { display: grid; gap: 7px; overflow-y: auto; padding: 4px; margin: -4px; min-height: 52px; }
 .item { display: grid; grid-template-columns: 8px 1fr auto; gap: 10px; align-items: center; padding: 10px; border: 1px solid var(--line); background: #0c0f14; cursor: pointer; }
 .item:hover { background: #10151b; border-color: rgba(138,247,213,.3); }
 .item-gem { width: 7px; height: 25px; }
@@ -105,6 +105,9 @@ canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
 .scrap { color: var(--amber); font-size: 11px; border-left: 1px solid var(--line); padding-left: 9px; }
 .empty-bag { color: #4e5b59; text-align: center; font-size: 12px; padding: 28px 0; }
 .bag-tip { color: #52605e; font-size: 10px; margin-top: 12px; text-align: center; }
+.slot.drag-over, .item.drag-over, .bag-list.drag-over { border-color: var(--mint); box-shadow: inset 0 0 18px rgba(138,247,213,.12), 0 0 10px rgba(138,247,213,.1); }
+.dragging { opacity: .35; }
+canvas.drag-map-target { cursor: copy; box-shadow: inset 0 0 0 2px rgba(138,247,213,.42); }
 
 .side-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 16px 22px 20px; border-top: 1px solid var(--line); }
 .action-btn { background: #0b0f14; color: #9badaa; border: 1px solid var(--line); padding: 10px; cursor: pointer; letter-spacing: .08em; font-size: 11px; }

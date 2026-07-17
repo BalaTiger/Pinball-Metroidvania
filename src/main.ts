@@ -1,6 +1,7 @@
 import "./style.css";
 import type { Door, Enemy, Item, MetaData, Npc, SaveData, StatKey, Vec } from "./types";
 import { WORLD, PLAYER_START, corridors, freshDoors, freshEnemies, freshNpcs, inWalkable, obstacles, roomAt, rooms } from "./world";
+import { findGridPath } from "./pathfinding";
 
 const SAVE_KEY = "echo-orbit:run";
 const META_KEY = "echo-orbit:meta";
@@ -23,6 +24,7 @@ interface HitEvent { key:string; id:string; progress:number; vx:number; vy:numbe
 interface Fragment { x:number; y:number; vx:number; vy:number; life:number; size:number; rotation:number; spin:number }
 interface FloatingText { x:number; y:number; life:number; text:string }
 interface ShieldRipple { x:number; y:number; life:number }
+interface DraggedItem { source: "inventory" | "equipped"; index: number; id: string }
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -40,7 +42,7 @@ function saveMeta(meta: MetaData) { localStorage.setItem(META_KEY, JSON.stringif
 function initialSave(meta: MetaData): SaveData {
   return {
     player: { ...PLAYER_START, hp: 8, maxHp: 8, currency: 0 },
-    enemies: freshEnemies(), doors: freshDoors(), drops: [], inventory: [], equipped: [null, null, null],
+    enemies: freshEnemies(), doors: freshDoors(), drops: [], inventory: [], equipped: Array<Item | null>(6).fill(null),
     discovered: [...meta.permanentFog], turn: 1, npcs: freshNpcs(),
   };
 }
@@ -67,9 +69,12 @@ class Game {
   shieldRipples: ShieldRipple[] = [];
   dropTrails=new Map<string,Vec[]>();
   doorFlash = 0;
+  draggedItem: DraggedItem | null = null;
+  suppressItemClickUntil = 0;
 
   constructor(data: SaveData) {
     this.data = data;
+    this.data.equipped = [...this.data.equipped, ...Array<Item | null>(6).fill(null)].slice(0, 6);
     this.data.doors=this.data.doors.filter((door)=>door.id!=="d-north");
     for (const door of freshDoors()) {
       const saved=this.data.doors.find((candidate)=>candidate.id===door.id);
@@ -110,8 +115,8 @@ class Game {
           </div>
           <aside class="sidebar">
             <section class="objective"><div class="kicker">当前目标</div><h3 id="objectiveTitle">找到空洞冠冕</h3><p id="objectiveText">探索固定的回环地图，穿过迷雾并击败深处的最终守卫。</p></section>
-            <section class="equipment"><div class="section-head"><h4>谐振槽 · 3</h4><span class="kicker">点击卸下</span></div><div class="slots" id="slots"></div></section>
-            <section class="bag"><div class="section-head"><h4>回收舱</h4><span class="kicker" id="bagCount">0 / 8</span></div><div class="bag-list" id="bagList"></div><div class="bag-tip">点击装备 · 右键分解为碎片</div></section>
+            <section class="equipment"><div class="section-head"><h4>谐振槽 · 6</h4><span class="kicker">点击卸下 · 支持拖拽</span></div><div class="slots" id="slots"></div></section>
+            <section class="bag"><div class="section-head"><h4>回收舱</h4><span class="kicker" id="bagCount">0 / 8</span></div><div class="bag-list" id="bagList"></div><div class="bag-tip">点击装备 · 拖拽整理/丢弃 · 右键分解</div></section>
             <div class="side-actions"><button class="action-btn" id="teleportBtn">折跃</button><button class="action-btn" id="exitBtn">保存并退出</button></div>
           </aside>
         </section>
@@ -130,6 +135,19 @@ class Game {
     this.canvas.addEventListener("pointerleave", () => { this.mouse.inside = false; this.preview = null; });
     this.canvas.addEventListener("pointerdown", (e) => {
       if (e.button === 0 && this.phase === "aim" && this.preview) this.launch(this.preview);
+    });
+    this.canvas.addEventListener("dragover", (e) => {
+      if (!this.draggedItem || this.phase !== "aim") return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+      this.canvas.classList.add("drag-map-target");
+    });
+    this.canvas.addEventListener("dragleave", () => this.canvas.classList.remove("drag-map-target"));
+    this.canvas.addEventListener("drop", (e) => {
+      e.preventDefault();
+      this.canvas.classList.remove("drag-map-target");
+      const point = this.pointerWorld(e);
+      this.dropDraggedItem(point);
     });
     document.querySelector("#exitBtn")!.addEventListener("click", () => this.saveAndExit());
     document.querySelector("#mapBtn")!.addEventListener("click", () => this.openMap());
@@ -151,7 +169,7 @@ class Game {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  pointerWorld(e: PointerEvent) {
+  pointerWorld(e: { clientX: number; clientY: number }) {
     const r = this.canvas.getBoundingClientRect();
     return { x: e.clientX - r.left + this.camera.x, y: e.clientY - r.top + this.camera.y };
   }
@@ -394,7 +412,7 @@ class Game {
   collectDrop(item:Item){
     this.data.drops=this.data.drops.filter((drop)=>drop.id!==item.id);
     this.dropTrails.delete(item.id);
-    delete item.x;delete item.y;delete item.vx;delete item.vy;delete item.attracted;
+    delete item.x;delete item.y;delete item.vx;delete item.vy;delete item.attracted;delete item.pickupLocked;
     if(this.data.inventory.length<8){this.data.inventory.push(item);this.toast(`拾取：${item.name}`,"normal");}
     else{const value=scrapValue(item);this.data.player.currency+=value;this.toast(`回收舱已满，自动分解 +${value} 碎片`,"amber");}
     this.updateUI();
@@ -403,6 +421,7 @@ class Game {
   updateDrops(seconds:number){
     for(const drop of [...this.data.drops]){
       if(drop.x===undefined||drop.y===undefined)continue;
+      if(drop.pickupLocked)continue;
       const dx=this.data.player.x-drop.x,dy=this.data.player.y-drop.y,distance=Math.hypot(dx,dy);
       if(distance<=PICKUP_RADIUS)drop.attracted=true;
       if(!drop.attracted)continue;
@@ -437,7 +456,10 @@ class Game {
       const step = enemy.kind === "charger" ? 100 : enemy.kind === "boss" ? 72 : 58;
       const travel = Math.min(step, Math.max(0, len - enemy.r - 14));
       const from = { x: enemy.x, y: enemy.y };
-      const to = this.moveEnemy(enemy, dx / len, dy / len, travel);
+      const waypoint = this.enemyWaypoint(enemy);
+      const pathDx = waypoint.x - enemy.x, pathDy = waypoint.y - enemy.y;
+      const pathLength = Math.hypot(pathDx, pathDy) || 1;
+      const to = this.moveEnemy(enemy, pathDx / pathLength, pathDy / pathLength, Math.min(travel, pathLength));
       this.enemyAnimating = { enemy, from, to, start: performance.now() };
       setTimeout(() => {
         enemy.x = to.x; enemy.y = to.y; this.enemyAnimating = null;
@@ -450,16 +472,52 @@ class Game {
     setTimeout(() => next(0), 220);
   }
 
+  enemyWaypoint(enemy: Enemy): Vec {
+    const start = { x: enemy.x, y: enemy.y };
+    const goal = { x: this.data.player.x, y: this.data.player.y };
+    const canTraverse = (from: Vec, to: Vec) => this.enemyCanTraverse(enemy, from, to);
+    if (canTraverse(start, goal)) return goal;
+
+    const path = findGridPath({
+      start,
+      goal,
+      width: WORLD.w,
+      height: WORLD.h,
+      cellSize: 24,
+      isWalkable: (point) => this.enemyPositionIsFree(enemy, point.x, point.y),
+      canTraverse,
+      maxVisited: 7000,
+    });
+    if (!path) return goal;
+
+    // Pull the next waypoint as far forward as line of sight permits, removing grid-like zig-zags.
+    for (let i = path.length - 1; i > 0; i--) if (canTraverse(start, path[i])) return path[i];
+    return path[1] ?? goal;
+  }
+
+  enemyCanTraverse(enemy: Enemy, from: Vec, to: Vec) {
+    const distance = Math.hypot(to.x - from.x, to.y - from.y);
+    const samples = Math.max(1, Math.ceil(distance / 4));
+    for (let i = 1; i <= samples; i++) {
+      const t = i / samples;
+      if (!this.enemyPositionIsFree(enemy, lerp(from.x, to.x, t), lerp(from.y, to.y, t))) return false;
+    }
+    return true;
+  }
+
+  enemyPositionIsFree(enemy: Enemy, x: number, y: number) {
+    if (!circleInWalkable(x, y, enemy.r)) return false;
+    if (obstacles.some((obstacle) => circleRect(x, y, enemy.r, obstacle))) return false;
+    if (this.data.doors.some((door) => this.enemyDoorIsSolid(door) && circleRect(x, y, enemy.r, door))) return false;
+    return !this.data.enemies.some((other) => other.id !== enemy.id && other.alive && other.active !== false && Math.hypot(x - other.x, y - other.y) < enemy.r + other.r + 3);
+  }
+
   moveEnemy(enemy:Enemy,dirX:number,dirY:number,distance:number):Vec{
     let x=enemy.x,y=enemy.y,remaining=distance;
     const stepSize=4;
     while(remaining>0){
       const step=Math.min(stepSize,remaining),nextX=x+dirX*step,nextY=y+dirY*step;
-      const hitsWall=!circleInWalkable(nextX,nextY,enemy.r);
-      const hitsObstacle=obstacles.some((obstacle)=>circleRect(nextX,nextY,enemy.r,obstacle));
-      const hitsDoor=this.data.doors.some((door)=>this.enemyDoorIsSolid(door)&&circleRect(nextX,nextY,enemy.r,door));
-      const hitsEnemy=this.data.enemies.some((other)=>other.id!==enemy.id&&other.alive&&other.active!==false&&Math.hypot(nextX-other.x,nextY-other.y)<enemy.r+other.r+3);
-      if(hitsWall||hitsObstacle||hitsDoor||hitsEnemy)break;
+      if(!this.enemyPositionIsFree(enemy,nextX,nextY))break;
       x=nextX;y=nextY;remaining-=step;
     }
     return{x,y};
@@ -499,13 +557,9 @@ class Game {
     if (this.phase !== "aim") return;
     const index = this.data.inventory.findIndex((i) => i.id === id);
     if (index < 0) return;
-    const item = this.data.inventory.splice(index, 1)[0];
     const slot = this.data.equipped.findIndex((i) => !i);
-    if (slot >= 0) this.data.equipped[slot] = item;
-    else {
-      const replaced = this.data.equipped[0]; this.data.equipped[0] = item;
-      if (replaced) this.data.inventory.push(replaced);
-    }
+    if (slot < 0) { this.toast("装备栏已满", "amber"); return; }
+    this.data.equipped[slot] = this.data.inventory.splice(index, 1)[0];
     this.preview = null; this.updateUI(); this.autoSave();
   }
 
@@ -525,6 +579,98 @@ class Game {
     this.updateUI(); this.autoSave();
   }
 
+  beginItemDrag(event: DragEvent, dragged: DraggedItem) {
+    if (this.phase !== "aim") { event.preventDefault(); return; }
+    this.draggedItem = dragged;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", dragged.id);
+    }
+    (event.currentTarget as HTMLElement).classList.add("dragging");
+  }
+
+  endItemDrag(event: DragEvent) {
+    (event.currentTarget as HTMLElement).classList.remove("dragging");
+    this.canvas.classList.remove("drag-map-target");
+    document.querySelectorAll(".drag-over").forEach((element) => element.classList.remove("drag-over"));
+    this.draggedItem = null;
+    this.suppressItemClickUntil = performance.now() + 120;
+  }
+
+  moveDraggedToSlot(target: number) {
+    const dragged = this.draggedItem;
+    if (!dragged || this.phase !== "aim") return;
+    if (dragged.source === "equipped") {
+      const source = dragged.index;
+      if (source === target || this.data.equipped[source]?.id !== dragged.id) return;
+      [this.data.equipped[source], this.data.equipped[target]] = [this.data.equipped[target], this.data.equipped[source]];
+    } else {
+      const source = this.data.inventory.findIndex((item) => item.id === dragged.id);
+      if (source < 0) return;
+      const item = this.data.inventory[source];
+      const replaced = this.data.equipped[target];
+      this.data.equipped[target] = item;
+      if (replaced) this.data.inventory.splice(source, 1, replaced);
+      else this.data.inventory.splice(source, 1);
+    }
+    this.finishInventoryChange();
+  }
+
+  moveDraggedToBag(target?: number) {
+    const dragged = this.draggedItem;
+    if (!dragged || this.phase !== "aim") return;
+    if (dragged.source === "equipped") {
+      if (this.data.inventory.length >= 8) { this.toast("回收舱已满", "amber"); return; }
+      const item = this.data.equipped[dragged.index];
+      if (!item || item.id !== dragged.id) return;
+      this.data.equipped[dragged.index] = null;
+      this.data.inventory.splice(Math.min(target ?? this.data.inventory.length, this.data.inventory.length), 0, item);
+    } else {
+      const source = this.data.inventory.findIndex((item) => item.id === dragged.id);
+      if (source < 0) return;
+      const [item] = this.data.inventory.splice(source, 1);
+      let insertion = target ?? this.data.inventory.length;
+      if (target !== undefined && source < target) insertion--;
+      this.data.inventory.splice(clamp(insertion, 0, this.data.inventory.length), 0, item);
+    }
+    this.finishInventoryChange();
+  }
+
+  dropDraggedItem(point: Vec) {
+    const dragged = this.draggedItem;
+    if (!dragged || this.phase !== "aim") return;
+    if (!this.dropPositionIsReachable(point)) { this.toast("只能丢弃在地图可到达区域", "amber"); return; }
+    let item: Item | undefined;
+    if (dragged.source === "equipped") {
+      item = this.data.equipped[dragged.index] ?? undefined;
+      if (!item || item.id !== dragged.id) return;
+      this.data.equipped[dragged.index] = null;
+    } else {
+      const source = this.data.inventory.findIndex((candidate) => candidate.id === dragged.id);
+      if (source < 0) return;
+      item = this.data.inventory.splice(source, 1)[0];
+    }
+    Object.assign(item, { x: point.x, y: point.y, vx: 0, vy: 0, attracted: false, pickupLocked: true });
+    this.data.drops.push(item);
+    this.toast(`已丢弃：${item.name}`, "amber");
+    this.finishInventoryChange();
+  }
+
+  dropPositionIsReachable(point: Vec) {
+    if (!circleInWalkable(point.x, point.y, 14)) return false;
+    if (obstacles.some((obstacle) => circleRect(point.x, point.y, 14, obstacle))) return false;
+    return !this.data.doors.some((door) => this.doorIsSolid(door) && circleRect(point.x, point.y, 14, door));
+  }
+
+  finishInventoryChange() {
+    this.draggedItem = null;
+    this.suppressItemClickUntil = performance.now() + 120;
+    this.canvas.classList.remove("drag-map-target");
+    this.preview = null;
+    this.updateUI();
+    this.autoSave();
+  }
+
   updateUI() {
     const s = this.stats();
     setText("hpText", `${Math.max(0, this.data.player.hp)} / ${this.data.player.maxHp}`);
@@ -536,14 +682,33 @@ class Game {
     const hint = document.querySelector("#hint")!;
     hint.innerHTML = this.phase === "aim" ? `<b>移动鼠标</b> 选择方向 · <b>点击</b> 发射 · 装备可随时调整` : this.phase === "enemy" ? `视野内敌人正在依次行动…` : `惯性航行中…`;
     const slotRoot = document.querySelector("#slots")!;
-    slotRoot.innerHTML = this.data.equipped.map((i, n) => i ? `<div class="slot" data-slot="${n}"><span class="rarity rarity-${i.rarity}"></span><div class="name">${i.name}</div><div class="bonus">${i.description}</div></div>` : `<div class="slot empty" data-slot="${n}">＋</div>`).join("");
-    slotRoot.querySelectorAll<HTMLElement>("[data-slot]").forEach((el) => el.addEventListener("click", () => this.unequip(Number(el.dataset.slot))));
+    slotRoot.innerHTML = this.data.equipped.map((i, n) => i ? `<div class="slot" draggable="${this.phase === "aim"}" data-slot="${n}" data-equipped-id="${i.id}"><span class="rarity rarity-${i.rarity}"></span><div class="name">${i.name}</div><div class="bonus">${i.description}</div></div>` : `<div class="slot empty" data-slot="${n}">＋</div>`).join("");
+    slotRoot.querySelectorAll<HTMLElement>("[data-slot]").forEach((el) => {
+      const slot = Number(el.dataset.slot);
+      el.addEventListener("click", () => { if (performance.now() >= this.suppressItemClickUntil) this.unequip(slot); });
+      el.addEventListener("dragover", (e) => { if (!this.draggedItem) return; e.preventDefault(); el.classList.add("drag-over"); });
+      el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+      el.addEventListener("drop", (e) => { e.preventDefault(); e.stopPropagation(); el.classList.remove("drag-over"); this.moveDraggedToSlot(slot); });
+      if (el.dataset.equippedId) {
+        el.addEventListener("dragstart", (e) => this.beginItemDrag(e, { source: "equipped", index: slot, id: el.dataset.equippedId! }));
+        el.addEventListener("dragend", (e) => this.endItemDrag(e));
+      }
+    });
     setText("bagCount", `${this.data.inventory.length} / 8`);
     const bag = document.querySelector("#bagList")!;
-    bag.innerHTML = this.data.inventory.length ? this.data.inventory.map((i) => `<div class="item" data-item="${i.id}"><span class="item-gem rarity-${i.rarity}"></span><div><div class="item-name">${i.name}</div><div class="item-desc">${i.description}</div></div><div class="scrap">分解 ${scrapValue(i)}</div></div>`).join("") : `<div class="empty-bag">尚未检测到可回收谐振物</div>`;
+    bag.innerHTML = this.data.inventory.length ? this.data.inventory.map((i, index) => `<div class="item" draggable="${this.phase === "aim"}" data-item="${i.id}" data-bag-index="${index}"><span class="item-gem rarity-${i.rarity}"></span><div><div class="item-name">${i.name}</div><div class="item-desc">${i.description}</div></div><div class="scrap">分解 ${scrapValue(i)}</div></div>`).join("") : `<div class="empty-bag">尚未检测到可回收谐振物</div>`;
+    bag.addEventListener("dragover", (e) => { if (!this.draggedItem) return; e.preventDefault(); bag.classList.add("drag-over"); });
+    bag.addEventListener("dragleave", (e) => { if (!bag.contains((e as DragEvent).relatedTarget as Node | null)) bag.classList.remove("drag-over"); });
+    bag.addEventListener("drop", (e) => { e.preventDefault(); bag.classList.remove("drag-over"); this.moveDraggedToBag(); });
     bag.querySelectorAll<HTMLElement>("[data-item]").forEach((el) => {
-      el.addEventListener("click", () => this.equip(el.dataset.item!));
+      const index = Number(el.dataset.bagIndex);
+      el.addEventListener("click", () => { if (performance.now() >= this.suppressItemClickUntil) this.equip(el.dataset.item!); });
       el.addEventListener("contextmenu", (e) => { e.preventDefault(); this.scrap(el.dataset.item!); });
+      el.addEventListener("dragstart", (e) => this.beginItemDrag(e, { source: "inventory", index, id: el.dataset.item! }));
+      el.addEventListener("dragend", (e) => this.endItemDrag(e));
+      el.addEventListener("dragover", (e) => { if (!this.draggedItem) return; e.preventDefault(); e.stopPropagation(); el.classList.add("drag-over"); });
+      el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+      el.addEventListener("drop", (e) => { e.preventDefault(); e.stopPropagation(); el.classList.remove("drag-over"); this.moveDraggedToBag(index); });
     });
     const tp = document.querySelector<HTMLButtonElement>("#teleportBtn")!;
     tp.disabled = this.phase !== "aim" || this.meta.teleporters.length === 0;
@@ -595,20 +760,20 @@ class Game {
 
   gameOver() {
     this.phase = "dead"; localStorage.removeItem(SAVE_KEY); this.meta.runs++; saveMeta(this.meta); this.updateUI();
-    setTimeout(() => this.modal(`<div class="modal-card"><div class="kicker" style="color:var(--red)">信号永久中断</div><h2>本次航行已终结</h2><p>装备、敌人与机关状态已经丢失。${this.meta.cartographerMet ? "绘图师记录的迷雾区域仍被保留。" : "你尚未遇见绘图师，本局地图记录无法保留。"}</p><div class="modal-actions"><button class="menu-btn" id="retryBtn">开始下一局</button><button class="action-btn" id="titleBtn">返回主界面</button></div></div>`), 500);
     setTimeout(() => {
+      this.modal(`<div class="modal-card"><div class="kicker" style="color:var(--red)">信号永久中断</div><h2>本次航行已终结</h2><p>装备、敌人与机关状态已经丢失。${this.meta.cartographerMet ? "绘图师记录的迷雾区域仍被保留。" : "你尚未遇见绘图师，本局地图记录无法保留。"}</p><div class="modal-actions"><button class="menu-btn" id="retryBtn">开始下一局</button><button class="action-btn" id="titleBtn">返回主界面</button></div></div>`);
       document.querySelector("#retryBtn")?.addEventListener("click", () => startNew());
       document.querySelector("#titleBtn")?.addEventListener("click", () => showTitle());
-    }, 550);
+    }, 500);
   }
 
   victory() {
     this.phase = "victory"; localStorage.removeItem(SAVE_KEY); this.meta.runs++; this.meta.bestBosses = 2; saveMeta(this.meta); this.updateUI();
-    setTimeout(() => this.modal(`<div class="modal-card"><div class="kicker">最终核心已静默</div><h2>轨道重新回响</h2><p>你找到了空洞冠冕，并消灭了固定地图最深处的最终 Boss。这个纵向切片已经完成一轮完整循环。</p><div class="modal-actions"><button class="menu-btn" id="retryBtn">再次航行</button><button class="action-btn" id="titleBtn">返回主界面</button></div></div>`), 650);
     setTimeout(() => {
+      this.modal(`<div class="modal-card"><div class="kicker">最终核心已静默</div><h2>轨道重新回响</h2><p>你找到了空洞冠冕，并消灭了固定地图最深处的最终 Boss。这个纵向切片已经完成一轮完整循环。</p><div class="modal-actions"><button class="menu-btn" id="retryBtn">再次航行</button><button class="action-btn" id="titleBtn">返回主界面</button></div></div>`);
       document.querySelector("#retryBtn")?.addEventListener("click", () => startNew());
       document.querySelector("#titleBtn")?.addEventListener("click", () => showTitle());
-    }, 700);
+    }, 650);
   }
 
   frame(time: number) {
@@ -619,6 +784,10 @@ class Game {
       const motionProgress=easeOut(t);
       const pos = pointOnPath(a.shot.points, motionProgress);
       this.data.player.x = pos.x; this.data.player.y = pos.y;
+      const origin = a.shot.points[0];
+      if (Math.hypot(pos.x - origin.x, pos.y - origin.y) >= 4) {
+        for (const drop of this.data.drops) drop.pickupLocked = false;
+      }
       let replanned=false;
       const dueEvents:[number,"break"|"block"|"hit",any][]=[];
       for(const event of a.shot.breaks)if(event.progress<=motionProgress&&!a.triggeredBreaks.has(event.id))dueEvents.push([event.progress,"break",event]);
@@ -857,7 +1026,12 @@ function setText(id:string,text:string,paragraph=false){const el=document.queryS
 
 let game: Game | null = null;
 
+function removeOverlays() {
+  document.querySelectorAll(".overlay").forEach((overlay) => overlay.remove());
+}
+
 function showTitle() {
+  removeOverlays();
   game = null;
   const meta=loadMeta(), hasSave=!!localStorage.getItem(SAVE_KEY);
   app.innerHTML=`<div class="overlay"><div class="title-screen"><div class="title-visual"><div class="orbit o1"></div><div class="orbit o2"></div><div class="hero-orb"></div>${Array.from({length:12},(_,i)=>`<i class="trail-dot" style="left:${16+i*3.1}%;top:${37+i*1.25}%"></i>`).join("")}<div class="title-copy"><div class="num">PROJECT / 01</div><h1>回声<span>轨道</span></h1><p>PINBALL × ROGUELIKE</p></div></div><div class="menu-panel"><div class="eyebrow">固定迷宫 · 永久死亡</div><h2>${hasSave?"检测到未完成航行":"等待首次航向"}</h2><p>在无重力遗迹中规划反弹路径。每一次停下，都会让迷雾中的敌人获得回应。</p>${hasSave?`<button class="menu-btn" id="continueBtn">继续上次游戏</button>`:""}<button class="menu-btn" id="newBtn">${hasSave?"开始新游戏 · 删除临时存档":"开始新游戏"}</button><div class="menu-meta"><div class="meta-card">已完成航行<b>${meta.runs}</b></div><div class="meta-card">永久地图记录<b>${meta.cartographerMet?Math.round(meta.permanentFog.length/(WORLD.w/CELL*WORLD.h/CELL)*100)+"%":"未解锁"}</b></div></div></div></div></div>`;
@@ -865,7 +1039,7 @@ function showTitle() {
   document.querySelector("#newBtn")?.addEventListener("click",startNew);
 }
 
-function continueGame(){try{const raw=localStorage.getItem(SAVE_KEY);if(!raw)return startNew();game=new Game(JSON.parse(raw));}catch{startNew()}}
-function startNew(){localStorage.removeItem(SAVE_KEY);const meta=loadMeta();game=new Game(initialSave(meta));game.autoSave()}
+function continueGame(){removeOverlays();try{const raw=localStorage.getItem(SAVE_KEY);if(!raw)return startNew();game=new Game(JSON.parse(raw));}catch{startNew()}}
+function startNew(){removeOverlays();localStorage.removeItem(SAVE_KEY);const meta=loadMeta();game=new Game(initialSave(meta));game.autoSave()}
 
 showTitle();

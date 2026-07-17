@@ -54,6 +54,7 @@ export interface Item {
   vx?: number;
   vy?: number;
   attracted?: boolean;
+  pickupLocked?: boolean;
 }
 
 export interface Npc {
