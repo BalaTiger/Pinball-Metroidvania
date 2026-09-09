@@ -15,6 +15,9 @@ export interface Enemy {
   roomId: string;
   alive: boolean;
   active?: boolean;
+  /** Optional encounter metadata used by named bosses. */
+  bossId?: string;
+  phase?: number;
 }
 
 export interface Door {
@@ -37,6 +40,28 @@ export interface Room {
   rect: Rect;
   boss?: boolean;
   final?: boolean;
+  /** Stable region used by streaming, map UI and narrative systems. */
+  regionId?: string;
+}
+
+export interface Region {
+  id: string;
+  name: string;
+  /** Short lore hook shown by the map and objective panels. */
+  lore: string;
+  biome: string;
+  bounds: Rect;
+  roomIds: string[];
+  recommendedPower: number;
+  bossId?: string;
+}
+
+export interface MapChunk {
+  key: string;
+  x: number;
+  y: number;
+  loaded: boolean;
+  regionIds: string[];
 }
 
 export type Rarity = "common" | "rare" | "epic";

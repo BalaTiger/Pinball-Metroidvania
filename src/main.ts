@@ -1,7 +1,9 @@
 import "./style.css";
 import type { Door, Enemy, Item, MetaData, Npc, SaveData, StatKey, Vec } from "./types";
-import { WORLD, PLAYER_START, corridors, freshDoors, freshEnemies, freshNpcs, inWalkable, obstacles, roomAt, rooms } from "./world";
+import { WORLD, PLAYER_START, chunkAt, corridors, freshDoors, freshEnemies, freshNpcs, getLoadedGeometry, inWalkable, regionAt, regions, roomAt, rooms } from "./world";
 import { findGridPath } from "./pathfinding";
+import { BOSS_DEFINITIONS, bossAttackDamage, bossDefinition, bossMoveVector, bossPhase } from "./bosses";
+import { loreForRoom, ROOM_LORE, STORY_BEATS, storyBeatFor } from "./lore";
 
 const SAVE_KEY = "echo-orbit:run";
 const META_KEY = "echo-orbit:meta";
@@ -59,6 +61,9 @@ class Game {
   animation: { shot: ShotResult; start: number; duration: number; triggeredBreaks:Set<string>; triggeredBlocks:Set<string>; triggeredHits:Set<string> } | null = null;
   enemyAnimating: { enemy: Enemy; from: Vec; to: Vec; start: number } | null = null;
   currentRoom = "";
+  currentRegion = "";
+  activeGeometry = getLoadedGeometry(PLAYER_START.x, PLAYER_START.y, 1);
+  activeChunk = "";
   lastFrame = 0;
   shake = 0;
   flash = 0;
@@ -81,6 +86,7 @@ class Game {
       if(!saved)this.data.doors.push(door);
       else Object.assign(saved,{axis:door.axis,breakDirection:door.breakDirection,bossLock:door.bossLock,bossExit:door.bossExit,bossRoom:door.bossRoom});
     }
+    this.ensureBossRoster();
     const savedRoom = roomAt(this.data.player.x, this.data.player.y)?.id;
     for (const enemy of this.data.enemies) if (enemy.kind === "boss" && enemy.active === undefined) enemy.active = enemy.roomId === savedRoom;
     this.mount();
@@ -90,6 +96,29 @@ class Game {
     this.updateUI();
     requestAnimationFrame((t) => this.frame(t));
     this.toast("航向校准完成。拖动鼠标预览轨迹，点击弹射。", "normal");
+  }
+
+  /** Merge new named encounters into old saves while preserving current HP/progress. */
+  ensureBossRoster() {
+    for (const definition of BOSS_DEFINITIONS) {
+      let enemy = this.data.enemies.find((candidate) => candidate.kind === "boss" && (candidate.bossId === definition.id || candidate.id === definition.id || candidate.roomId === definition.roomId));
+      if (!enemy) {
+        const room = rooms.find((candidate) => candidate.id === definition.roomId);
+        if (!room) continue;
+        const index = BOSS_DEFINITIONS.indexOf(definition);
+        enemy = { id: definition.id, kind: "boss", x: room.rect.x + room.rect.w * (.35 + (index % 3) * .15), y: room.rect.y + room.rect.h * (.42 + (index % 2) * .16), r: definition.radius, hp: definition.maxHp, maxHp: definition.maxHp, damage: definition.damage, roomId: definition.roomId, alive: true, active: false, bossId: definition.id, phase: 1 };
+        this.data.enemies.push(enemy);
+      } else {
+        const oldMax = enemy.maxHp || definition.maxHp;
+        const ratio = oldMax > 0 ? enemy.hp / oldMax : 1;
+        enemy.bossId = definition.id;
+        enemy.maxHp = definition.maxHp;
+        enemy.hp = Math.max(0, Math.min(definition.maxHp, Math.round(definition.maxHp * ratio)));
+        enemy.r = definition.radius;
+        enemy.damage = definition.damage;
+        enemy.phase = bossPhase(enemy, definition);
+      }
+    }
   }
 
   mount() {
@@ -109,12 +138,12 @@ class Game {
         <section class="game-layout">
           <div class="viewport" id="viewport">
             <canvas id="game"></canvas>
-            <div class="room-tag"><div class="eyebrow">区域 · <span id="roomIndex">00</span></div><h2 id="roomName">未知区域</h2></div>
+            <div class="room-tag"><div class="eyebrow">区域 · <span id="roomIndex">00</span> · <span id="chunkText">区块 0,0</span></div><h2 id="roomName">未知区域</h2></div>
             <div class="toast-stack" id="toasts"></div>
             <div class="hintbar" id="hint"><b>移动鼠标</b> 选择方向 · <b>点击</b> 发射 · 轨迹将计算所有反弹</div>
           </div>
           <aside class="sidebar">
-            <section class="objective"><div class="kicker">当前目标</div><h3 id="objectiveTitle">找到空洞冠冕</h3><p id="objectiveText">探索固定的回环地图，穿过迷雾并击败深处的最终守卫。</p></section>
+            <section class="objective"><div class="kicker">当前目标 · <span id="storyBeatLabel">唤醒引力锚</span></div><h3 id="objectiveTitle">找到空洞冠冕</h3><p id="objectiveText">探索固定的回环地图，穿过迷雾并击败深处的最终守卫。</p><div class="story-card" id="storyCard"><div class="story-card-title">阿刻戎轨道城</div><div class="story-card-text">循环正在重启。</div></div></section>
             <section class="equipment"><div class="section-head"><h4>谐振槽 · 6</h4><span class="kicker">点击卸下 · 支持拖拽</span></div><div class="slots" id="slots"></div></section>
             <section class="bag"><div class="section-head"><h4>回收舱</h4><span class="kicker" id="bagCount">0 / 8</span></div><div class="bag-list" id="bagList"></div><div class="bag-tip">点击装备 · 拖拽整理/丢弃 · 右键分解</div></section>
             <div class="side-actions"><button class="action-btn" id="teleportBtn">折跃</button><button class="action-btn" id="exitBtn">保存并退出</button></div>
@@ -227,7 +256,7 @@ class Game {
         }
       }
 
-      for (const ob of obstacles) {
+      for (const ob of this.activeGeometry.obstacles) {
         if (!circleRect(nx, ny, 14, ob)) continue;
         const testX = !circleRect(p.x + vx * motionStep, p.y, 14, ob);
         const testY = !circleRect(p.x, p.y + vy * motionStep, 14, ob);
@@ -296,6 +325,14 @@ class Game {
     if(!enemy?.alive)return false;
     const shotStats=this.stats(),damage=shotStats.damage+shotStats.ricochet;
     enemy.hp-=damage;
+    if (enemy.kind === "boss") {
+      const definition = bossDefinition(enemy);
+      const nextPhase = bossPhase(enemy, definition);
+      if (nextPhase !== (enemy.phase || 1)) {
+        enemy.phase = nextPhase;
+        this.toast(`${definition?.name || "守卫"}进入第 ${nextPhase} 阶段`, "red");
+      }
+    }
     this.shake=Math.max(this.shake,4);
     const killed=enemy.hp<=0;
     if(killed)this.killEnemy(enemy);
@@ -350,7 +387,8 @@ class Game {
   killEnemy(enemy: Enemy) {
     enemy.alive = false;
     this.data.drops.push(this.generateItem(enemy.x, enemy.y, enemy.kind === "boss"));
-    this.toast(enemy.kind === "boss" ? "守卫核心崩解——高阶谐振物已掉落。" : "目标消除，检测到装备掉落。", "amber");
+    const definition = bossDefinition(enemy);
+    this.toast(enemy.kind === "boss" ? `${definition?.name || "守卫"}核心崩解——${definition?.reward || "高阶谐振物"}已掉落。` : "目标消除，检测到装备掉落。", "amber");
     if (enemy.id === "final-boss") this.victory();
   }
 
@@ -386,11 +424,12 @@ class Game {
 
   activateBossAtRest() {
     const stoppedRoom = roomAt(this.data.player.x, this.data.player.y);
-    if (!stoppedRoom?.boss) return;
+    if (!stoppedRoom) return;
     const boss = this.data.enemies.find((e) => e.roomId === stoppedRoom.id && e.kind === "boss" && e.alive);
     if (!boss || boss.active !== false) return;
     boss.active = true;
-    this.toast("封锁协议启动——守卫信号正在实体化。", "red");
+    const definition = bossDefinition(boss);
+    this.toast(`${definition?.name || "守卫"}现身：${definition?.epithet || "封锁协议启动"}${definition?.lore ? ` · ${definition.lore}` : ""}`, "red");
   }
 
   checkNpcs(path: Vec[]) {
@@ -453,17 +492,22 @@ class Game {
       if (!enemy.alive) return next(i + 1);
       const dx = this.data.player.x - enemy.x, dy = this.data.player.y - enemy.y;
       const len = Math.hypot(dx, dy) || 1;
-      const step = enemy.kind === "charger" ? 100 : enemy.kind === "boss" ? 72 : 58;
+      const definition = bossDefinition(enemy);
+      if (definition) enemy.phase = bossPhase(enemy, definition);
+      const step = enemy.kind === "charger" ? 100 : enemy.kind === "boss" ? (enemy.phase === 3 ? 94 : 72) : 58;
       const travel = Math.min(step, Math.max(0, len - enemy.r - 14));
       const from = { x: enemy.x, y: enemy.y };
-      const waypoint = this.enemyWaypoint(enemy);
+      const move = definition ? bossMoveVector(enemy, this.data.player, definition) : { x: dx / len, y: dy / len };
+      const waypoint = definition?.behavior === "blink" && enemy.phase === 3
+        ? { x: enemy.x + dx / len * Math.min(180, len), y: enemy.y + dy / len * Math.min(180, len) }
+        : definition ? { x: enemy.x + move.x * Math.max(1, travel), y: enemy.y + move.y * Math.max(1, travel) } : this.enemyWaypoint(enemy);
       const pathDx = waypoint.x - enemy.x, pathDy = waypoint.y - enemy.y;
       const pathLength = Math.hypot(pathDx, pathDy) || 1;
       const to = this.moveEnemy(enemy, pathDx / pathLength, pathDy / pathLength, Math.min(travel, pathLength));
       this.enemyAnimating = { enemy, from, to, start: performance.now() };
       setTimeout(() => {
         enemy.x = to.x; enemy.y = to.y; this.enemyAnimating = null;
-        if (Math.hypot(enemy.x - this.data.player.x, enemy.y - this.data.player.y) <= enemy.r + 18) this.damagePlayer(enemy.damage);
+        if (Math.hypot(enemy.x - this.data.player.x, enemy.y - this.data.player.y) <= enemy.r + 18) this.damagePlayer(definition ? bossAttackDamage(enemy, definition) : enemy.damage);
         this.updateUI();
         setTimeout(() => next(i + 1), 120);
       }, 300);
@@ -507,7 +551,7 @@ class Game {
 
   enemyPositionIsFree(enemy: Enemy, x: number, y: number) {
     if (!circleInWalkable(x, y, enemy.r)) return false;
-    if (obstacles.some((obstacle) => circleRect(x, y, enemy.r, obstacle))) return false;
+    if (this.activeGeometry.obstacles.some((obstacle) => circleRect(x, y, enemy.r, obstacle))) return false;
     if (this.data.doors.some((door) => this.enemyDoorIsSolid(door) && circleRect(x, y, enemy.r, door))) return false;
     return !this.data.enemies.some((other) => other.id !== enemy.id && other.alive && other.active !== false && Math.hypot(x - other.x, y - other.y) < enemy.r + other.r + 3);
   }
@@ -551,6 +595,7 @@ class Game {
   }
 
   isDiscovered(x: number, y: number) { return this.data.discovered.includes(`${Math.floor(x / CELL)},${Math.floor(y / CELL)}`); }
+  isLoaded(x: number, y: number) { const key = chunkAt(x, y).key; return this.activeGeometry.chunks.some((chunk) => chunk.key === key); }
   onScreen(x: number, y: number, pad = 0) { return x > this.camera.x - pad && x < this.camera.x + this.camera.w + pad && y > this.camera.y - pad && y < this.camera.y + this.camera.h + pad; }
 
   equip(id: string) {
@@ -658,7 +703,7 @@ class Game {
 
   dropPositionIsReachable(point: Vec) {
     if (!circleInWalkable(point.x, point.y, 14)) return false;
-    if (obstacles.some((obstacle) => circleRect(point.x, point.y, 14, obstacle))) return false;
+    if (this.activeGeometry.obstacles.some((obstacle) => circleRect(point.x, point.y, 14, obstacle))) return false;
     return !this.data.doors.some((door) => this.doorIsSolid(door) && circleRect(point.x, point.y, 14, door));
   }
 
@@ -715,6 +760,17 @@ class Game {
     const exit = document.querySelector<HTMLButtonElement>("#exitBtn")!;
     exit.disabled = this.phase !== "aim";
     const aliveBosses = this.data.enemies.filter((e) => e.kind === "boss" && e.alive).length;
+    const beat = storyBeatFor(aliveBosses, this.meta.cartographerMet, this.phase === "victory");
+    setText("storyBeatLabel", beat.title);
+    const storyCard = document.querySelector<HTMLElement>("#storyCard");
+    if (storyCard) {
+      const title = storyCard.querySelector<HTMLElement>(".story-card-title");
+      const body = storyCard.querySelector<HTMLElement>(".story-card-text");
+      if (title) title.textContent = beat.title;
+      if (body) body.textContent = beat.text;
+    }
+    const lore = loreForRoom(this.currentRoom);
+    if (lore && aliveBosses > 1) { setText("objectiveTitle", lore.objective); setText("objectiveText", lore.summary, true); }
     if (aliveBosses === 1) { setText("objectiveTitle", "进入空洞冠冕"); setText("objectiveText", "熔炉守卫已沉默。沿南侧回环寻找最终 Boss 房。", true); }
   }
 
@@ -728,22 +784,44 @@ class Game {
     document.querySelectorAll<HTMLElement>("[data-tp]").forEach((el) => el.addEventListener("click", () => {
       const npc = known.find((n) => n.id === el.dataset.tp)!;
       this.data.player.x = npc.x; this.data.player.y = npc.y; this.revealCircle(npc.x, npc.y, this.stats().vision);
+      const chunk = chunkAt(npc.x, npc.y);
+      this.activeChunk = chunk.key;
+      this.activeGeometry = getLoadedGeometry(npc.x, npc.y, 1);
+      setText("chunkText", `区块 ${chunk.key} · 已载入 ${this.activeGeometry.chunks.length}`);
       document.querySelector(".overlay")?.remove(); this.toast(`已折跃至 ${npc.name}`, "normal"); this.autoSave();
     }));
   }
 
   openMap() {
-    const scale = .28, w = WORLD.w * scale, h = WORLD.h * scale;
-    this.modal(`<div class="modal-card" style="width:${w + 60}px"><div class="section-head"><div><div class="kicker">固定世界地图</div><h2 style="margin:5px 0">回声星图</h2></div><button class="icon-btn" data-close>关闭 · ESC</button></div><canvas id="mapCanvas" width="${w}" height="${h}" style="width:${w}px;height:${h}px;background:#06080b;border:1px solid var(--line);cursor:default"></canvas><p>青色：本局已探索区域 · 金色：永久记录的折跃坐标 · 红色：Boss 信号</p></div>`);
+    const scale = .2, w = WORLD.w * scale, h = WORLD.h * scale;
+    const loreList = rooms.map((room) => {
+      const lore = ROOM_LORE[room.id];
+      return lore ? `<div class="map-lore"><span class="map-lore-dot" style="background:${lore.color}"></span><div><b>${lore.epithet}</b><small>${lore.objective}</small></div></div>` : "";
+    }).join("") + regions.filter((region) => !region.roomIds.some((id) => ROOM_LORE[id])).map((region) => `<div class="map-lore"><span class="map-lore-dot" style="background:#7ce9df"></span><div><b>${region.name}</b><small>${region.lore}</small></div></div>`).join("");
+    this.modal(`<div class="modal-card" style="width:${Math.min(w + 60, this.camera.w - 24)}px"><div class="section-head"><div><div class="kicker">分块世界地图 · 阿刻戎轨道城</div><h2 style="margin:5px 0">回声星图</h2></div><button class="icon-btn" data-close>关闭 · ESC</button></div><canvas id="mapCanvas" width="${w}" height="${h}" style="width:${w}px;height:${h}px;max-width:100%;height:auto;background:#06080b;border:1px solid var(--line);cursor:default"></canvas><p>青色：本局已探索 · 金色：永久记录的折跃坐标 · 红色：Boss 信号 · 网格：流式区块</p><div class="map-lore-list">${loreList}</div></div>`);
     const canvas = document.querySelector<HTMLCanvasElement>("#mapCanvas")!, c = canvas.getContext("2d")!;
     c.scale(scale, scale); c.fillStyle = "#12191b";
     for (const r of [...rooms.map((x) => x.rect), ...corridors]) c.fillRect(r.x, r.y, r.w, r.h);
+    c.strokeStyle = "rgba(117,197,184,.2)"; c.lineWidth = 2;
+    for (let x = 0; x <= WORLD.w; x += 640) { c.beginPath(); c.moveTo(x, 0); c.lineTo(x, WORLD.h); c.stroke(); }
+    for (let y = 0; y <= WORLD.h; y += 640) { c.beginPath(); c.moveTo(0, y); c.lineTo(WORLD.w, y); c.stroke(); }
+    const activeRegion = regionAt(this.data.player.x, this.data.player.y);
+    c.font = "28px Microsoft YaHei"; c.textBaseline = "top";
+    for (const region of regions) { c.strokeStyle = region.id === activeRegion?.id ? "rgba(255,189,105,.9)" : "rgba(117,197,184,.25)"; c.strokeRect(region.bounds.x, region.bounds.y, region.bounds.w, region.bounds.h); c.fillStyle = "rgba(138,247,213,.4)"; c.fillText(region.name, region.bounds.x + 18, region.bounds.y + 36); }
     const discovered = new Set(this.data.discovered);
     c.fillStyle = "rgba(111,225,196,.42)";
     for (const key of discovered) { const [x,y] = key.split(",").map(Number); c.fillRect(x*CELL,y*CELL,CELL,CELL); }
     for (const n of freshNpcs().filter((n) => this.meta.teleporters.includes(n.id))) { c.fillStyle="#ffbd69"; c.beginPath(); c.arc(n.x,n.y,20,0,Math.PI*2); c.fill(); }
     for (const e of this.data.enemies.filter((e) => e.kind === "boss" && e.alive && e.active !== false && this.isDiscovered(e.x,e.y))) { c.fillStyle="#ff6274"; c.beginPath(); c.arc(e.x,e.y,22,0,Math.PI*2); c.fill(); }
     c.fillStyle="#effff9"; c.beginPath(); c.arc(this.data.player.x,this.data.player.y,18,0,Math.PI*2); c.fill();
+    c.font = "26px Rajdhani, sans-serif";
+    c.textBaseline = "top";
+    for (const room of rooms) {
+      const lore = ROOM_LORE[room.id];
+      if (!lore || !this.isDiscovered(room.rect.x + room.rect.w / 2, room.rect.y + room.rect.h / 2)) continue;
+      c.fillStyle = lore.color;
+      c.fillText(room.name, room.rect.x + 12, room.rect.y + 12);
+    }
   }
 
   modal(html: string) {
@@ -831,8 +909,26 @@ class Game {
     const k = 1 - Math.pow(.001, dt / 1000);
     this.camera.x += (tx - this.camera.x) * k; this.camera.y += (ty - this.camera.y) * k;
     const room = roomAt(this.data.player.x, this.data.player.y);
+    const region = regionAt(this.data.player.x, this.data.player.y);
+    const chunk = chunkAt(this.data.player.x, this.data.player.y);
+    if (chunk.key !== this.activeChunk) {
+      this.activeChunk = chunk.key;
+      this.activeGeometry = getLoadedGeometry(this.data.player.x, this.data.player.y, 1);
+      setText("chunkText", `区块 ${chunk.key} · 已载入 ${this.activeGeometry.chunks.length}`);
+    }
+    if (region && region.id !== this.currentRegion) {
+      this.currentRegion = region.id;
+      if (!room) { setText("roomName", region.name); setText("roomIndex", "R"); }
+      this.toast(`${region.name} · ${region.lore}`, "normal");
+    }
     if (room && room.id !== this.currentRoom) {
       this.currentRoom = room.id; setText("roomName", room.name); setText("roomIndex", String(rooms.indexOf(room) + 1).padStart(2,"0"));
+      const lore = loreForRoom(room.id);
+      if (lore) {
+        this.toast(`${lore.epithet}：${lore.signal}`, room.boss ? "red" : "normal");
+        setText("objectiveTitle", lore.objective);
+        setText("objectiveText", lore.summary, true);
+      }
       if (room.boss && this.data.enemies.some((e) => e.roomId === room.id && e.alive && e.active !== false)) this.toast("警告：封锁协议启动。消灭守卫前无法离开。", "red");
     }
   }
@@ -849,7 +945,11 @@ class Game {
   }
 
   drawWorld(c: CanvasRenderingContext2D) {
-    const all = [...rooms.map((r) => r.rect), ...corridors];
+    // Stream only the 3x3 chunk neighborhood around the player. Collision and
+    // pathfinding still use the complete authored geometry, so crossing a
+    // chunk boundary never changes gameplay semantics.
+    const loaded = getLoadedGeometry(this.data.player.x, this.data.player.y, 1);
+    const all = [...loaded.rooms.map((r) => r.rect), ...loaded.corridors];
     c.fillStyle="#0d2021";
     for (const r of all) c.fillRect(r.x,r.y,r.w,r.h);
     this.drawWalkableBoundary(c, all);
@@ -861,8 +961,8 @@ class Game {
     for (let x=0;x<WORLD.w;x+=48){c.beginPath();c.moveTo(x,0);c.lineTo(x,WORLD.h);c.stroke()}
     for (let y=0;y<WORLD.h;y+=48){c.beginPath();c.moveTo(0,y);c.lineTo(WORLD.w,y);c.stroke()}
     c.restore();
-    for (const o of obstacles) { c.fillStyle="#293446"; c.fillRect(o.x,o.y,o.w,o.h); c.strokeStyle="#557073"; c.strokeRect(o.x+.5,o.y+.5,o.w-1,o.h-1); c.fillStyle="rgba(138,247,213,.12)"; for(let y=o.y+10;y<o.y+o.h;y+=16)c.fillRect(o.x+5,y,o.w-10,2); }
-    for (const room of rooms.filter((r)=>r.boss)) { c.strokeStyle=room.final?"rgba(255,98,116,.32)":"rgba(255,189,105,.24)";c.lineWidth=3;c.strokeRect(room.rect.x+9,room.rect.y+9,room.rect.w-18,room.rect.h-18); }
+    for (const o of loaded.obstacles) { c.fillStyle="#293446"; c.fillRect(o.x,o.y,o.w,o.h); c.strokeStyle="#557073"; c.strokeRect(o.x+.5,o.y+.5,o.w-1,o.h-1); c.fillStyle="rgba(138,247,213,.12)"; for(let y=o.y+10;y<o.y+o.h;y+=16)c.fillRect(o.x+5,y,o.w-10,2); }
+    for (const room of loaded.rooms.filter((r)=>r.boss)) { c.strokeStyle=room.final?"rgba(255,98,116,.32)":"rgba(255,189,105,.24)";c.lineWidth=3;c.strokeRect(room.rect.x+9,room.rect.y+9,room.rect.w-18,room.rect.h-18); }
   }
 
   drawWalkableBoundary(c: CanvasRenderingContext2D, areas: { x:number; y:number; w:number; h:number }[]) {
@@ -963,6 +1063,7 @@ class Game {
 
   drawDrops(c: CanvasRenderingContext2D,time:number) {
     for(const d of this.data.drops){
+      if (d.x !== undefined && d.y !== undefined && !this.isLoaded(d.x, d.y)) continue;
       const color=d.rarity==="epic"?"#b688ff":d.rarity==="rare"?"#55d6e8":"#a8b5b2",trail=this.dropTrails.get(d.id)||[];
       if(trail.length>1){c.save();c.strokeStyle=color;c.lineWidth=3;c.shadowColor=color;c.shadowBlur=8;c.beginPath();c.moveTo(trail[0].x,trail[0].y);for(const point of trail)c.lineTo(point.x,point.y);c.stroke();c.restore();}
       const x=d.x!,y=d.y!+(d.attracted?0:Math.sin(time/280+Number(d.id.length))*4);c.save();c.translate(x,y);c.rotate(time/900);c.fillStyle=color;c.shadowColor=color;c.shadowBlur=d.attracted?22:15;c.fillRect(-8,-8,16,16);c.restore();
@@ -975,11 +1076,23 @@ class Game {
   }
 
   drawNpcs(c: CanvasRenderingContext2D,time:number) {
-    for(const n of this.data.npcs){if(!this.isDiscovered(n.x,n.y))continue;c.save();c.translate(n.x,n.y);c.strokeStyle=n.kind==="cartographer"?"#8af7d5":"#ffbd69";c.lineWidth=2;c.globalAlpha=.75+.2*Math.sin(time/500);c.beginPath();c.arc(0,0,22,0,Math.PI*2);c.stroke();c.beginPath();c.arc(0,0,12,time/700,time/700+Math.PI*1.4);c.stroke();c.fillStyle=c.strokeStyle;c.font="10px Rajdhani";c.textAlign="center";c.fillText(n.kind==="cartographer"?"绘图师":"折跃师",0,40);c.restore();}
+    for(const n of this.data.npcs){if(!this.isLoaded(n.x,n.y)||!this.isDiscovered(n.x,n.y))continue;c.save();c.translate(n.x,n.y);c.strokeStyle=n.kind==="cartographer"?"#8af7d5":"#ffbd69";c.lineWidth=2;c.globalAlpha=.75+.2*Math.sin(time/500);c.beginPath();c.arc(0,0,22,0,Math.PI*2);c.stroke();c.beginPath();c.arc(0,0,12,time/700,time/700+Math.PI*1.4);c.stroke();c.fillStyle=c.strokeStyle;c.font="10px Rajdhani";c.textAlign="center";c.fillText(n.kind==="cartographer"?"绘图师":"折跃师",0,40);c.restore();}
   }
 
   drawEnemies(c: CanvasRenderingContext2D,time:number) {
-    for(const e of this.data.enemies){if(!e.alive||e.active===false||!this.isDiscovered(e.x,e.y))continue;let x=e.x,y=e.y;if(this.enemyAnimating?.enemy.id===e.id){const t=clamp((time-this.enemyAnimating.start)/300,0,1);x=lerp(this.enemyAnimating.from.x,this.enemyAnimating.to.x,t);y=lerp(this.enemyAnimating.from.y,this.enemyAnimating.to.y,t)}c.save();c.translate(x,y);const boss=e.kind==="boss";c.fillStyle=boss?"#6f1f35":e.kind==="sentinel"?"#7b522f":"#39434b";c.strokeStyle=boss?"#ff6274":e.kind==="charger"?"#ffbd69":"#8aa29e";c.lineWidth=boss?3:2;c.shadowColor=c.strokeStyle;c.shadowBlur=boss?18:5;c.beginPath();if(e.kind==="sentinel"){for(let i=0;i<8;i++){const a=i*Math.PI/4+(i?0:time/1000),rr=i%2?e.r*.75:e.r;c.lineTo(Math.cos(a)*rr,Math.sin(a)*rr)}c.closePath()}else c.arc(0,0,e.r,0,Math.PI*2);c.fill();c.stroke();c.shadowBlur=0;c.fillStyle="#080a0d";c.beginPath();c.arc(0,0,Math.max(5,e.r*.28),0,Math.PI*2);c.fill();c.restore();c.fillStyle="#252a31";c.fillRect(x-e.r,y-e.r-13,e.r*2,4);c.fillStyle=boss?"#ff6274":"#ffbd69";c.fillRect(x-e.r,y-e.r-13,e.r*2*(e.hp/e.maxHp),4);}
+    for(const e of this.data.enemies){
+      if(!e.alive||e.active===false||!this.isLoaded(e.x,e.y)||!this.isDiscovered(e.x,e.y))continue;
+      let x=e.x,y=e.y;if(this.enemyAnimating?.enemy.id===e.id){const t=clamp((time-this.enemyAnimating.start)/300,0,1);x=lerp(this.enemyAnimating.from.x,this.enemyAnimating.to.x,t);y=lerp(this.enemyAnimating.from.y,this.enemyAnimating.to.y,t)}
+      const boss=e.kind==="boss", profile=boss?bossDefinition(e):undefined;
+      c.save();c.translate(x,y);
+      c.fillStyle=profile?.color || (e.kind==="sentinel"?"#7b522f":"#39434b");
+      c.strokeStyle=profile?.accent || (e.kind==="charger"?"#ffbd69":"#8aa29e");
+      c.lineWidth=boss?3:2;c.shadowColor=c.strokeStyle;c.shadowBlur=boss?18:5;c.beginPath();
+      if(e.kind==="sentinel"){for(let i=0;i<8;i++){const a=i*Math.PI/4+(i?0:time/1000),rr=i%2?e.r*.75:e.r;c.lineTo(Math.cos(a)*rr,Math.sin(a)*rr)}c.closePath()}else c.arc(0,0,e.r,0,Math.PI*2);
+      c.fill();c.stroke();c.shadowBlur=0;c.fillStyle="#080a0d";c.beginPath();c.arc(0,0,Math.max(5,e.r*.28),0,Math.PI*2);c.fill();c.restore();
+      c.fillStyle="#252a31";c.fillRect(x-e.r,y-e.r-13,e.r*2,4);c.fillStyle=profile?.accent || (boss?"#ff6274":"#ffbd69");c.fillRect(x-e.r,y-e.r-13,e.r*2*(e.hp/e.maxHp),4);
+      if(profile && this.isDiscovered(e.x,e.y)){ c.fillStyle=profile.accent; c.font="600 11px 'Microsoft YaHei',sans-serif"; c.textAlign="center"; c.globalAlpha=.9; c.fillText(`${profile.name} · P${e.phase || 1}`,x,y-e.r-19); }
+    }
   }
 
   drawPreview(c: CanvasRenderingContext2D,time:number) {
@@ -1034,7 +1147,7 @@ function showTitle() {
   removeOverlays();
   game = null;
   const meta=loadMeta(), hasSave=!!localStorage.getItem(SAVE_KEY);
-  app.innerHTML=`<div class="overlay"><div class="title-screen"><div class="title-visual"><div class="orbit o1"></div><div class="orbit o2"></div><div class="hero-orb"></div>${Array.from({length:12},(_,i)=>`<i class="trail-dot" style="left:${16+i*3.1}%;top:${37+i*1.25}%"></i>`).join("")}<div class="title-copy"><div class="num">PROJECT / 01</div><h1>回声<span>轨道</span></h1><p>PINBALL × ROGUELIKE</p></div></div><div class="menu-panel"><div class="eyebrow">固定迷宫 · 永久死亡</div><h2>${hasSave?"检测到未完成航行":"等待首次航向"}</h2><p>在无重力遗迹中规划反弹路径。每一次停下，都会让迷雾中的敌人获得回应。</p>${hasSave?`<button class="menu-btn" id="continueBtn">继续上次游戏</button>`:""}<button class="menu-btn" id="newBtn">${hasSave?"开始新游戏 · 删除临时存档":"开始新游戏"}</button><div class="menu-meta"><div class="meta-card">已完成航行<b>${meta.runs}</b></div><div class="meta-card">永久地图记录<b>${meta.cartographerMet?Math.round(meta.permanentFog.length/(WORLD.w/CELL*WORLD.h/CELL)*100)+"%":"未解锁"}</b></div></div></div></div></div>`;
+  app.innerHTML=`<div class="overlay"><div class="title-screen"><div class="title-visual"><div class="orbit o1"></div><div class="orbit o2"></div><div class="hero-orb"></div>${Array.from({length:12},(_,i)=>`<i class="trail-dot" style="left:${16+i*3.1}%;top:${37+i*1.25}%"></i>`).join("")}<div class="title-copy"><div class="num">PROJECT / 01</div><h1>回声<span>轨道</span></h1><p>PINBALL × ROGUELIKE</p></div></div><div class="menu-panel"><div class="eyebrow">阿刻戎轨道城 · 分块星域</div><h2>${hasSave?"检测到未完成航行":"等待首次航向"}</h2><p>轨道城被困在毁灭前的九分钟循环。你是唯一能承受全部回声的载体，必须穿越九大区域，击败守卫并夺回空洞冠冕。</p><div class="prologue-line">主线：${STORY_BEATS[0].title} → 拼合失落坐标 → 让熔炉熄火 → 直面零相</div>${hasSave?`<button class="menu-btn" id="continueBtn">继续上次游戏</button>`:""}<button class="menu-btn" id="newBtn">${hasSave?"开始新游戏 · 删除临时存档":"开始新游戏"}</button><div class="menu-meta"><div class="meta-card">已完成航行<b>${meta.runs}</b></div><div class="meta-card">永久地图记录<b>${meta.cartographerMet?Math.round(meta.permanentFog.length/(WORLD.w/CELL*WORLD.h/CELL)*100)+"%":"未解锁"}</b></div></div></div></div></div>`;
   document.querySelector("#continueBtn")?.addEventListener("click",continueGame);
   document.querySelector("#newBtn")?.addEventListener("click",startNew);
 }
